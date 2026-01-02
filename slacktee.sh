@@ -22,13 +22,13 @@
 # ----------
 # Default Configuration
 # ----------
-webhook_url=""       # Incoming Webhooks integration URL. Old way to interact with Slack. (Deprecated)
-token=""             # The authentication token of the bot user. Used for accessing Slack APIs.
-channel="general"    # Default channel to post messages. '#' is prepended, if it doesn't start with '#' or '@'.
-tmp_dir="/tmp"       # Temporary file is created in this directory.
-username="slacktee"  # Default username to post messages.
-icon="ghost"         # Default emoji to post messages. Don't wrap it with ':'. See http://www.emoji-cheat-sheet.com; can be a url too.
-attachment=""        # Default color of the attachments. If an empty string is specified, the attachments are not used.
+webhook_url="${SLACKTEE_WEBHOOK_URL:-}"       # Incoming Webhooks integration URL. Old way to interact with Slack. (Deprecated)
+token="${SLACKTEE_TOKEN:-}"             # The authentication token of the bot user. Used for accessing Slack APIs.
+channel="${SLACKTEE_CHANNEL:-general}"    # Default channel to post messages. '#' is prepended, if it doesn't start with '#' or '@'.
+tmp_dir="${SLACKTEE_TMP_DIR:-/tmp}"       # Temporary file is created in this directory.
+username="${SLACKTEE_USERNAME:-slacktee}"  # Default username to post messages.
+icon="${SLACKTEE_ICON:-ghost}"         # Default emoji to post messages. Don't wrap it with ':'. See http://www.emoji-cheat-sheet.com; can be a url too.
+attachment="${SLACKTEE_ATTACHMENT:-}"        # Default color of the attachments. If an empty string is specified, the attachments are not used.
 
 # ----------
 # Initialization
@@ -85,6 +85,78 @@ function err_exit()
 function get_ok_in_response() {
     local response=$1
     echo "$(echo "$response" | awk 'match($0, /"ok":([^,}]+)/) {print substr($0, RSTART+5, RLENGTH-5)}')"
+}
+
+function get_upload_url() {
+    local filename=$1
+
+    # Get file size - try different methods for different OS
+    local length
+    length=$(stat -c%s "$filename" 2>/dev/null)
+    if [[ -z "$length" ]]; then
+        length=$(stat -f%z "$filename" 2>/dev/null)
+    fi
+    if [[ -z "$length" ]]; then
+        length=$(wc -c < "$filename" 2>/dev/null | tr -d ' ')
+    fi
+
+    local name=$(basename "$filename")
+
+    if [[ -z "$name" ]]; then
+        name="unnamed"
+    fi
+    if [[ -z "$length" ]]; then
+        length=0
+    fi
+
+    # Use form fields, not JSON (Slack API expects -F parameters)
+    curl --silent \
+         -H "Authorization: Bearer $token" \
+         -F "filename=$name" \
+         -F "length=$length" \
+         https://slack.com/api/files.getUploadURLExternal
+}
+
+function complete_upload() {
+    local file_id=$1
+    local channels=$2
+
+    # Build files JSON array for form field
+    local files_json="[{\"id\": \"$file_id\"}]"
+
+    if [[ -n "$channels" ]]; then
+        # Use channel_id for single channel or channels for comma-separated list
+        curl --silent \
+             -H "Authorization: Bearer $token" \
+             -F "files=$files_json" \
+             -F "channel_id=$channels" \
+             https://slack.com/api/files.completeUploadExternal
+    else
+        curl --silent \
+             -H "Authorization: Bearer $token" \
+             -F "files=$files_json" \
+             https://slack.com/api/files.completeUploadExternal
+    fi
+}
+
+function get_file_id_from_response() {
+    local response=$1
+    echo "$response" | grep -o '"file_id":"[^"]*"' | cut -d'"' -f4
+}
+
+function get_upload_url_from_response() {
+    local response=$1
+    echo "$response" | grep -o '"upload_url":"[^"]*"' | cut -d'"' -f4 | sed 's/\\//g'
+}
+
+function get_permalink_from_response() {
+    local response=$1
+    echo "$response" | grep -o '"permalink":"[^"]*"' | cut -d'"' -f4 | sed 's/\\//g'
+}
+
+function get_url_private_from_response() {
+    local response=$1
+    echo "$response" | grep -o '"url_private":"[^"]*"' | cut -d'"' -f4 | sed 's/\\//g'
 }
 
 function handle_signal()
@@ -253,7 +325,7 @@ function send_message()
 							\"username\": \"$username\", \
 							$message_attr \"icon_emoji\": \"$icon_emoji\", \
 							$parseMode}"
-					fi						
+					fi
 
 					post_result=$(curl -H "Authorization: Bearer $token" -H 'Content-type: application/json; charset=utf-8' -X POST -d "$json" https://slack.com/api/chat.postMessage 2> /dev/null)
 					if [ $(get_ok_in_response "$post_result") != "true" ]; then
@@ -789,6 +861,8 @@ function check_configuration()
 
 	if [[ $channel == "" ]]; then
 		err_exit 1 "Please specify a channel."
+	elif [[ ( "$channel" != "#"* ) && ( "$channel" != "@"* ) ]]; then
+		channel="#$channel"
 	fi
 
 	if [[ -n "$icon" ]]; then
@@ -853,7 +927,7 @@ function main()
 	fi
 
 	timestamp="$(date +'%m%d%Y-%H%M%S')"
-	filename="$tmp_dir/$filetitle$$-$timestamp.log"
+	filename="$tmp_dir/$filetitle$$-$timestamp.txt"
 
 	if [[ "$mode" == "file" ]]; then
 		touch $filename
@@ -876,25 +950,101 @@ function main()
 		send_message "$text"
 	elif [[ "$mode" == "file" ]]; then
 		if [[ -s "$filename" ]]; then
-			channels_param=""
-			if [[ ( "$channel" == "#"* ) ]]; then
-				# Set channels for making the file public
-				channels_param="-F channels=$channel"
+			# Step 1: Get upload URL from Slack
+			get_url_result=$(get_upload_url "$filename")
+
+			if [ $(get_ok_in_response "$get_url_result") != "true" ]; then
+			    write_to_stderr "Failed to get upload URL."
+			    err_exit 1 "$get_url_result"
 			fi
-			upload_result="$(curl -F file=@"$filename" -F token="$token" $channels_param https://slack.com/api/files.upload 2> /dev/null)"
-			if [ $(get_ok_in_response "$upload_result") != "true" ]; then
-			    write_to_stderr "Upload failed. Please make sure slacktee is a member of $channel."
-			    err_exit 1 $upload_result
+
+			file_id=$(get_file_id_from_response "$get_url_result")
+			upload_url=$(get_upload_url_from_response "$get_url_result")
+
+			$debug && printf "Got file_id: $file_id and upload_url: $upload_url\n"
+
+			if [[ -z "$file_id" || -z "$upload_url" ]]; then
+			    write_to_stderr "Failed to extract file_id or upload_url from response."
+			    err_exit 1 "$get_url_result"
 			fi
-			access_url="$(echo "$upload_result" | awk 'match($0, /url_private":"([^"]*)"/) {print substr($0, RSTART+14, RLENGTH-15)}'|sed 's/\\//g')"
-			download_url="$(echo "$upload_result" | awk 'match($0, /url_private_download":"([^"]*)"/) {print substr($0, RSTART+23, RLENGTH-24)}'|sed 's/\\//g')"
+
+				# Step 2: Upload file to the upload URL
+			$debug && printf "Uploading file to: $upload_url\n"
+			upload_result=$(curl --silent -X POST \
+				-F "file=@$filename" \
+				"$upload_url")
+
+			# The upload URL returns 200 OK on success
+			if [[ $? -ne 0 ]]; then
+			    write_to_stderr "File upload to upload URL failed."
+			    err_exit 1 "$upload_result"
+			fi
+
+			# Step 3: Complete the upload and optionally share to channel
+			# Need to convert channel name to channel ID for the API
+			channel_id=""
+			if [[ "$channel" == "#"* ]]; then
+				# For public channels, we need to get the channel ID first
+				channel_name="${channel#\#}"
+				channel_lookup=$(curl --silent -H "Authorization: Bearer $token" \
+					-G \
+					--data "types=public_channel" \
+					https://slack.com/api/conversations.list)
+
+				if [ $(get_ok_in_response "$channel_lookup") == "true" ]; then
+					# Find the channel ID matching the channel name
+					channel_id=$(echo "$channel_lookup" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for channel in data.get('channels', []):
+    if channel.get('name') == '$channel_name':
+        print(channel.get('id'))
+        break
+" 2>/dev/null || echo "")
+
+					# Fallback: try using grep if python3 is not available
+					if [[ -z "$channel_id" ]]; then
+						channel_id=$(echo "$channel_lookup" | grep -o "\"name\":\"$channel_name\"" -A 1 | grep -o '"id":"[^"]*"' | cut -d'"' -f4 | head -1)
+					fi
+				fi
+			elif [[ "$channel" == "@"* ]]; then
+				# For DMs, we need to get the user ID
+				username="${channel:1}"
+				user_lookup=$(curl --silent -H "Authorization: Bearer $token" \
+					-G \
+					--data-urlencode "user=$username" \
+					https://slack.com/api/users.info)
+
+				if [ $(get_ok_in_response "$user_lookup") == "true" ]; then
+					channel_id=$(echo "$user_lookup" | grep -o '"id":"[^"]*"' | cut -d'"' -f4 | head -1)
+				fi
+			else
+				# Channel without # prefix might already be an ID or name
+				# Try to use it as-is for the API call
+				channel_id="$channel"
+			fi
+
+			complete_result=$(complete_upload "$file_id" "$channel_id")
+
+			if [ $(get_ok_in_response "$complete_result") != "true" ]; then
+			    write_to_stderr "Failed to complete upload."
+			    err_exit 1 "$complete_result"
+			fi
+
+			# Extract file URLs from the response
+			access_url=$(get_permalink_from_response "$complete_result")
+			private_url=$(get_url_private_from_response "$complete_result")
+
 			if [[ -n "$attachment" ]]; then
 				text="Input file has been uploaded"
 			else
 				if [[ "$title" != "" ]]; then
 					title=" of $title"
 				fi
-				text="Input file$title has been uploaded.\n$access_url\n\nYou can download it from the link below.\n$download_url"
+				text="Input file$title has been uploaded.\n$access_url"
+				if [[ -n "$private_url" ]]; then
+					text="$text\n\nYou can download it from the link below.\n$private_url"
+				fi
 			fi
 			send_message "$text"
 		fi
