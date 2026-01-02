@@ -22,8 +22,8 @@
 # ----------
 # Default Configuration
 # ----------
-webhook_url="${SLACKTEE_WEBHOOK_URL:-}"       # Incoming Webhooks integration URL
-token="${SLACKTEE_TOKEN:-}"             # The user's API authentication token, only used for file uploads or streaming
+webhook_url="${SLACKTEE_WEBHOOK_URL:-}"       # Incoming Webhooks integration URL. Old way to interact with Slack. (Deprecated)
+token="${SLACKTEE_TOKEN:-}"             # The authentication token of the bot user. Used for accessing Slack APIs.
 channel="${SLACKTEE_CHANNEL:-general}"    # Default channel to post messages. '#' is prepended, if it doesn't start with '#' or '@'.
 tmp_dir="${SLACKTEE_TMP_DIR:-/tmp}"       # Temporary file is created in this directory.
 username="${SLACKTEE_USERNAME:-slacktee}"  # Default username to post messages.
